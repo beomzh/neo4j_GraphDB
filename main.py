@@ -1,32 +1,31 @@
-import os
-import time
-from neo4j import GraphDatabase
-from neo4j.exceptions import ServiceUnavailable
+# from src.ingest import insert_user
+from src.crwling import NaverNewsToNeo4j
+from src.database import db
 
-uri = os.getenv("NEO4J_URI", "bolt://10.20.1.91:7687")
-user = os.getenv("NEO4J_USER", "neo4j")
-password = os.getenv("NEO4J_PASSWORD", "openmaru")
-
-def test_connection():
-    retry_count = 5
-    while retry_count > 0:
-        try:
-            print(f"🔄 Neo4j 연결 시도 중... (남은 횟수: {retry_count})")
-            driver = GraphDatabase.driver(uri, auth=(user, password))
-            with driver.session() as session:
-                result = session.run("RETURN 'Hello Neo4j from Docker!' AS message")
-                record = result.single()
-                print(f"\n✅ 결과: {record['message']}\n")
-                return # 성공 시 함수 종료
-        except ServiceUnavailable as e:
-            print(f"⚠️ 연결 실패 (서버가 아직 준비 안 됨): {e}")
-            retry_count -= 1
-            time.sleep(5) # 5초 후 재시도
-        finally:
-            if 'driver' in locals():
-                driver.close()
+def main():
+    print("실행합니다.")
+    # test 데이터 삽입
+    # try:
+    #     insert_user("Beomzh", "GraphRAG")
+    # finally:
+    #     db.close() # 프로그램 종료 시 공통 드라이버 닫기
+    app_crawler = NaverNewsToNeo4j()
+    try:
+        search_keyword = "연예"
+        app_crawler.crawl(search_keyword, pages=3) # 2페이지 크롤링
+        with db.driver.session() as session:
+            result = session.run("MATCH (a:Article) RETURN a.title AS title LIMIT 5")
+            records = list(result)
+            if not records:
+                print("데이터가 아직 DB에 없습니다. 쿼리를 확인하세요.")
+            for record in records:
+                print(f"저장된 기사: {record['title']}")
+        print("\n모든 데이터가 Neo4j에 성공적으로 저장되었습니다.")
+    finally:
+        app_crawler.close()
     
-    print("❌ 최종 연결 실패")
-
+            
 if __name__ == "__main__":
-    test_connection()
+    main()
+    
+    

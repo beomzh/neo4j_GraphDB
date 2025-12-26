@@ -4,3 +4,8 @@ langchain-neo4j
 langchain-openai    
 python-dotenv
 tiktoken
+bs4 >=0.0.2
+requests >=2.31.0
+beautifulsoup4 >=4.12.2
+playwright
+
