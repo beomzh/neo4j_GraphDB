@@ -1,14 +1,36 @@
+import os
 import time
 import re
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from src.database import db
 from urllib.parse import quote
 
-class NaverNewsToNeo4j:
+class NewsToNeo4j:
     def __init__(self):
-        self.driver = db.driver
-
+        try:
+            self.driver = db.driver
+        except Exception as e:
+            print(f"❌ DB 연결 실패: {e}")
+            self.driver = None
+            
+        self.log_dir = "crawl_logs"
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+            
+            
+    def save_debug_info(self, page, name):
+        """에러 발생 시점의 스크린샷과 HTML 소스를 저장합니다."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = os.path.join(self.log_dir, f"{name}_{timestamp}.png")
+        html_path = os.path.join(self.log_dir, f"{name}_{timestamp}.html")
+        
+        page.screenshot(path=screenshot_path)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        print(f"   📸 디버그 정보 저장됨: {screenshot_path}")
+        
     def close(self):
         self.driver.close()
 
@@ -34,8 +56,14 @@ class NaverNewsToNeo4j:
         """
         try:
             with self.driver.session() as session:
-                session.run(query, data)
+                result = session.run(query, data)
+                summary = result.consume()
+                if summary.counters.nodes_created > 0:
+                    print(f"      🏠 [DB] 새 노드 생성 완료")
+                elif summary.counters.properties_set > 0:
+                    print(f"      🔄 [DB] 기존 데이터 업데이트 완료")
                 return True
+            
         except Exception as e:
             print(f"   ❌ DB 저장 에러: {e}")
             return False
@@ -62,58 +90,101 @@ class NaverNewsToNeo4j:
         total_saved = 0
         
         with sync_playwright() as p:
-            # Docker 환경에서는 반드시 no-sandbox 옵션이 필요할 수 있음
-            browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-setuid-sandbox'])
+            # Docker 환경 최적화 설정
+            browser = p.chromium.launch(
+                headless=True, 
+                args=[
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-blink-features=AutomationControlled'
+                    ]
+                )
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                locale="ko-KR",
+                timezone_id="Asia/Seoul"                
             )
             page = context.new_page()
 
             for p_num in range(pages):
                 start = (p_num * 10) + 1
-                url = f"https://search.naver.com/search.naver?where=news&query={quote(keyword)}&start={start}"
-                
-                print(f"🔎 페이지 {p_num + 1} 접속 중...")
-                page.goto(url, wait_until="domcontentloaded")
-                
+                # url = f"https://search.naver.com/search.naver?where=news&query={quote(keyword)}&start={start}"
+                url = f"https://www.google.com/search?q={quote(keyword)}&tbm=nws&start={start}"
+                print(f"\n📡 [{p_num+1}/{pages}] 페이지 요청 중: {url}")
+                                
                 try:
-                    page.wait_for_selector(".news_tit", timeout=10000)
-                except:
-                    print(f"⚠️ {p_num + 1}페이지 로딩 실패 (캡차 가능성)")
+                    # 페이지 이동 및 응답 확인
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=10000)
+                    
+                    if response:
+                        print(f"   📥 [상태코드] {response.status}")
+                        if response.status == 429:
+                            print("   🚫 구글로부터 일시적 차단(Too Many Requests)을 당했습니다. 중단합니다.")
+                            break
+                        if response.status != 200:
+                            print(f"   ⚠️ 정상적인 응답이 아닙니다. (Status: {response.status})")
+                    
+                    # 뉴스 영역 확인
+                    if page.query_selector("div#search"):
+                        print(f"   🔎 [성공] 구글 뉴스 검색 결과 로드 완료")
+                    else:
+                        print(f"   ⚠️ [경고] 검색 결과 영역을 찾을 수 없습니다.")
+                        self.save_debug_info(page, f"no_search_result_p{p_num+1}")
+                        continue
+                    
+                    # 기사 리스트 추출
+                    content = page.content()
+                    soup = BeautifulSoup(content, 'html.parser')
+                    articles = soup.find_all('div', attrs={'data-ved': True})
+                    if not articles:
+                        # 만약 위 방법으로도 안 잡히면 더 넓은 범위로 탐색
+                        articles = soup.select('div#rso > div')
+                    print(f"   📦 [추출] {len(articles)}개의 후보 기사 발견")
+                    
+                    for idx, art in enumerate(articles):
+                        try:
+                            link_tag = art.find('a', href=True)
+                            if not link_tag or 'google.com' in link_tag['href']: continue 
+                            
+                            title_tag = link_tag.find(['div', 'h3'], attrs={'role': 'heading'})
+                            if not title_tag:
+                                title_tag = link_tag.find(['div', 'span']) # 더 유연하게 탐색
+                                
+                            if not title_tag or len(title_tag.get_text().strip()) < 5: continue
+
+                            # 상세 페이지 본문 수집을 할 것인지 선택 (속도 vs 데이터양)
+                            link = link_tag['href']
+                            content = ""
+                            
+                            # 본문까지 긁고 싶다면 활성화
+                            if True: 
+                                detail_page = context.new_page()
+                                content = self.get_article_content(detail_page, link)
+                                detail_page.close()
+
+                            data = {
+                                'title': title_tag.get_text().strip(),
+                                'link': link,
+                                'publisher': art.find('span').get_text().strip() if art.find('span') else "Google News", # 변수명 통일: source -> publisher
+                                'content': content
+                            }
+                            
+                            print(f"   📝 ({idx+1}) 데이터 추출 성공: {data['title'][:20]}...")
+
+                            if self.save_to_neo4j(data):
+                                total_saved += 1
+                                
+                        except Exception as inner_e:
+                            print(f"      ❗ [파싱 에러] {inner_e}")
+                            continue
+                                
+                except Exception as e:
+                    print(f"   ❌ [페이지 에러] {type(e).__name__}")
+                    self.save_debug_info(page, f"page_error_p{p_num+1}")
                     continue
-
-                # 기사 리스트 추출
-                content = page.content()
-                soup = BeautifulSoup(content, 'html.parser')
-                articles = soup.select('div.news_area')
-
-                for art in articles:
-                    title_tag = art.select_one('a.news_tit')
-                    press_tag = art.select_one('a.info.press')
-                    
-                    if not title_tag: continue
-                    
-                    link = title_tag['href']
-                    title = title_tag.get_text(strip=True)
-                    publisher = press_tag.get_text(strip=True) if press_tag else "알수없음"
-
-                    # [핵심 보완] 상세 페이지 들어가서 본문 가져오기
-                    detail_page = context.new_page()
-                    article_content = self.get_article_content(detail_page, link)
-                    detail_page.close()
-
-                    data = {
-                        'title': title,
-                        'link': link,
-                        'publisher': publisher,
-                        'content': article_content
-                    }
-                    
-                    if self.save_to_neo4j(data):
-                        print(f"   ✅ [저장] {title[:20]}...")
-                        total_saved += 1
-                    
-                    time.sleep(1) # 차단 방지를 위한 짧은 휴식
+                            
+                                
+                            
 
             browser.close()
         print(f"\n✨ 최종 {total_saved}건 Neo4j 저장 완료.")

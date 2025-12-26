@@ -1,5 +1,5 @@
 # from src.ingest import insert_user
-from src.crwling import NaverNewsToNeo4j
+from src.crwling import NewsToNeo4j
 from src.database import db
 
 def main():
@@ -9,7 +9,7 @@ def main():
     #     insert_user("Beomzh", "GraphRAG")
     # finally:
     #     db.close() # 프로그램 종료 시 공통 드라이버 닫기
-    app_crawler = NaverNewsToNeo4j()
+    app_crawler = NewsToNeo4j()
     try:
         search_keyword = "연예"
         app_crawler.crawl(search_keyword, pages=3) # 2페이지 크롤링
